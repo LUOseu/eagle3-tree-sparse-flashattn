@@ -21,7 +21,7 @@ class TreeSparseMetadata:
         col_idx: CSR column indices for tree KV blocks, shape [nnz_blocks].
         blk_type: Block type per nnz block, FULL(0) or MIXED(1), shape [nnz_blocks].
         mixed_mask_payload: Packed bitset payload for MIXED blocks, flattened int32.
-        mixed_mask_offset: Starting int32 offset (into payload) for each MIXED block.
+        mixed_mask_offset: Starting int32 offset (into payload) aligned to nnz_blocks.
         n_q_blocks: Number of Q blocks.
         n_tree_blocks: Number of tree KV blocks.
         block_m: Q block size.
@@ -121,6 +121,7 @@ def prepare_tree_sparse_metadata(
 
             if ones == total:
                 blk_type.append(FULL_BLOCK)
+                mixed_offsets.append(0)
             else:
                 blk_type.append(MIXED_BLOCK)
 
@@ -260,6 +261,7 @@ def block_sparse_tree_fwd_kernel(
         v = tl.load(v_ptrs, mask=(n_idx[:, None] < prefix_len), other=0.0)
 
         scores = tl.dot(q, k) * sm_scale
+        scores = tl.where(n_idx[None, :] < prefix_len, scores, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(scores, axis=1))
         p = tl.exp(scores - m_ij[:, None])
@@ -298,6 +300,7 @@ def block_sparse_tree_fwd_kernel(
         v = tl.load(v_ptrs, mask=(n_idx[:, None] < kv_len), other=0.0)
 
         scores = tl.dot(q, k) * sm_scale
+        scores = tl.where(n_idx[None, :] < kv_len, scores, float("-inf"))
 
         block_kind = tl.load(blk_type_ptr + ridx)
         if block_kind == MIXED_BLOCK:
