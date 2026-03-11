@@ -311,7 +311,7 @@ def block_sparse_tree_fwd_kernel(
         scores = tl.where(n_idx[None, :] < kv_len, scores, float("-inf"))
 
         block_kind = tl.load(blk_type_ptr + ridx)
-        if block_kind == MIXED_BLOCK:
+        if block_kind == 1:
             mix_idx = tl.load(mixed_mask_offset_ptr + ridx)
             words = tl.load(mixed_mask_payload_ptr + mix_idx + word_idx)
             local_mask = ((words >> bit_idx) & 1) == 1
