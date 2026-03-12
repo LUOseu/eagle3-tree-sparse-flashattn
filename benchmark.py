@@ -1,7 +1,8 @@
 import torch
 import triton
 import math
-from tree_flash_attn import prepare_tree_sparse_metadata, block_sparse_tree_fwd_kernel
+import torch.nn.functional as F
+from tree_sparse_flashattn import prepare_tree_sparse_metadata, block_sparse_tree_fwd_kernel
 
 def torch_baseline_tree_attention(q, k, v, tree_mask, prefix_len):
     """
@@ -31,6 +32,35 @@ def torch_baseline_tree_attention(q, k, v, tree_mask, prefix_len):
     attn_weights = torch.softmax(scores, dim=-1)
     out = torch.matmul(attn_weights, v_expanded)
     return out
+
+def flashattention_baseline_tree_attention(q, k, v, tree_mask, prefix_len):
+    """
+    FlashAttention backend baseline (via PyTorch SDPA flash kernel).
+    """
+    _, num_heads, q_len, head_dim = q.shape
+    _, num_kv_heads, kv_len, _ = k.shape
+    gqa_group = num_heads // num_kv_heads
+
+    # Expand K/V for GQA -> [B, H, kv_len, D]
+    k_expanded = k.repeat_interleave(gqa_group, dim=1)
+    v_expanded = v.repeat_interleave(gqa_group, dim=1)
+
+    full_mask = torch.zeros((q_len, kv_len), dtype=torch.bool, device=q.device)
+    full_mask[:, :prefix_len] = True
+    full_mask[:, prefix_len:] = tree_mask
+
+    # SDPA accepts additive masks; masked positions should be -inf.
+    additive_mask = torch.zeros((q_len, kv_len), dtype=q.dtype, device=q.device)
+    additive_mask = additive_mask.masked_fill(~full_mask, float('-inf'))
+    additive_mask = additive_mask.unsqueeze(0).unsqueeze(0)
+
+    return F.scaled_dot_product_attention(
+        q, k_expanded, v_expanded,
+        attn_mask=additive_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=1.0 / math.sqrt(head_dim),
+    )
 
 def test_lossless_and_acceleration():
     # --- 1. Settings ---
@@ -90,15 +120,20 @@ def test_lossless_and_acceleration():
     # --- 5. Run PyTorch Baseline ---
     o_torch = torch_baseline_tree_attention(q, k, v, tree_mask, PREFIX_LEN)
 
-    # --- 6. Verification ---
-    max_diff = (o_triton - o_torch).abs().max().item()
-    print(f"Max Difference between PyTorch and Triton: {max_diff:.6f}")
-    if max_diff < 1e-3:
+    # --- 6. Run FlashAttention Baseline2 ---
+    o_flash = flashattention_baseline_tree_attention(q, k, v, tree_mask, PREFIX_LEN)
+
+    # --- 7. Verification ---
+    max_diff_torch = (o_triton - o_torch).abs().max().item()
+    max_diff_flash = (o_triton - o_flash).abs().max().item()
+    print(f"Max Difference between PyTorch and Triton: {max_diff_torch:.6f}")
+    print(f"Max Difference between FlashAttention and Triton: {max_diff_flash:.6f}")
+    if max_diff_torch < 1e-3 and max_diff_flash < 1e-3:
         print(" Triton Kernel is LOSSLESS.")
     else:
         print("Precision mismatch.")
 
-    # --- 7. Benchmarking ---
+    # --- 8. Benchmarking ---
     print("\nRunning Benchmarks...")
     quantiles = [0.5, 0.2, 0.8]
     
@@ -116,10 +151,16 @@ def test_lossless_and_acceleration():
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=HEAD_DIM
         ), quantiles=quantiles
     )
+
+    ms_flash, min_flash, max_flash = triton.testing.do_bench(
+        lambda: flashattention_baseline_tree_attention(q, k, v, tree_mask, PREFIX_LEN), quantiles=quantiles
+    )
     
     print(f"PyTorch Dense+Mask Latency: {ms_torch:.3f} ms")
+    print(f"FlashAttention Baseline2 Latency: {ms_flash:.3f} ms")
     print(f"Triton Block-Sparse Latency: {ms_triton:.3f} ms")
     print(f"Speedup: {ms_torch / ms_triton:.2f}x")
+    print(f"Speedup vs FlashAttention Baseline2: {ms_flash / ms_triton:.2f}x")
 
 if __name__ == "__main__":
     test_lossless_and_acceleration()
