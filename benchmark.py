@@ -1,7 +1,9 @@
 import torch
 import triton
 import math
-from tree_flash_attn import prepare_tree_sparse_metadata, block_sparse_tree_fwd_kernel
+import importlib.util
+import torch.nn.functional as F
+from tree_sparse_flashattn import prepare_tree_sparse_metadata, block_sparse_tree_fwd_kernel
 
 def torch_baseline_tree_attention(q, k, v, tree_mask, prefix_len):
     """
@@ -31,6 +33,110 @@ def torch_baseline_tree_attention(q, k, v, tree_mask, prefix_len):
     attn_weights = torch.softmax(scores, dim=-1)
     out = torch.matmul(attn_weights, v_expanded)
     return out
+
+def flashattention_baseline_tree_attention(q, k, v, tree_mask, prefix_len):
+    """
+    FlashAttention backend baseline (via PyTorch SDPA flash kernel).
+    """
+    _, num_heads, q_len, head_dim = q.shape
+    _, num_kv_heads, kv_len, _ = k.shape
+    gqa_group = num_heads // num_kv_heads
+
+    # Expand K/V for GQA -> [B, H, kv_len, D]
+    k_expanded = k.repeat_interleave(gqa_group, dim=1)
+    v_expanded = v.repeat_interleave(gqa_group, dim=1)
+
+    full_mask = torch.zeros((q_len, kv_len), dtype=torch.bool, device=q.device)
+    full_mask[:, :prefix_len] = True
+    full_mask[:, prefix_len:] = tree_mask
+
+    # SDPA accepts additive masks; masked positions should be -inf.
+    additive_mask = torch.zeros((q_len, kv_len), dtype=q.dtype, device=q.device)
+    additive_mask = additive_mask.masked_fill(~full_mask, float('-inf'))
+    additive_mask = additive_mask.unsqueeze(0).unsqueeze(0)
+
+    return F.scaled_dot_product_attention(
+        q, k_expanded, v_expanded,
+        attn_mask=additive_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=1.0 / math.sqrt(head_dim),
+    )
+
+
+def _build_flashinfer_paged_kv_cache(k, v, page_size):
+    """
+    Convert [B, H_kv, KV_LEN, D] K/V tensors into FlashInfer paged KV cache layout:
+    [max_pages, 2, page_size, H_kv, D]
+    """
+    bsz, num_kv_heads, kv_len, head_dim = k.shape
+    pages_per_req = (kv_len + page_size - 1) // page_size
+    max_pages = bsz * pages_per_req
+
+    kv_cache = torch.zeros(
+        (max_pages, 2, page_size, num_kv_heads, head_dim),
+        dtype=k.dtype,
+        device=k.device,
+    )
+
+    for b in range(bsz):
+        req_base = b * pages_per_req
+        for p in range(pages_per_req):
+            start = p * page_size
+            end = min((p + 1) * page_size, kv_len)
+            valid = end - start
+            kv_cache[req_base + p, 0, :valid] = k[b, :, start:end, :].transpose(0, 1)
+            kv_cache[req_base + p, 1, :valid] = v[b, :, start:end, :].transpose(0, 1)
+
+    return kv_cache, pages_per_req
+
+
+def flashinfer_baseline3_tree_attention(q, k, v, prefix_len, page_size=16):
+    """
+    FlashInfer baseline3 using BatchDecodeWithPagedKVCacheWrapper.
+    NOTE: this baseline models decode-style contiguous visible KV (prefix + causal position),
+    so it is used as a speed baseline rather than exact sparse-tree semantic parity.
+    """
+    flashinfer = importlib.import_module("flashinfer")
+
+    bsz, num_qo_heads, q_len, head_dim = q.shape
+    _, num_kv_heads, kv_len, _ = k.shape
+
+    kv_cache, pages_per_req = _build_flashinfer_paged_kv_cache(k, v, page_size)
+
+    # Flatten [B, H, Q, D] -> [B*Q, H, D] for decode-style run.
+    q_decode = q.permute(0, 2, 1, 3).contiguous().reshape(bsz * q_len, num_qo_heads, head_dim)
+
+    # Each decode query (b, t) uses pages from request b, with contiguous visible KV length.
+    indptr = torch.arange(0, bsz * q_len + 1, device=q.device, dtype=torch.int32) * pages_per_req
+    indices = torch.empty(bsz * q_len * pages_per_req, device=q.device, dtype=torch.int32)
+    last_page_len = torch.empty(bsz * q_len, device=q.device, dtype=torch.int32)
+
+    for b in range(bsz):
+        page_ids = torch.arange(b * pages_per_req, (b + 1) * pages_per_req, device=q.device, dtype=torch.int32)
+        for t in range(q_len):
+            row = b * q_len + t
+            start = row * pages_per_req
+            indices[start:start + pages_per_req] = page_ids
+
+            visible = min(prefix_len + t + 1, kv_len)
+            tail = visible % page_size
+            last_page_len[row] = page_size if tail == 0 else tail
+
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+    )
+
+    out = wrapper.run(q_decode, kv_cache)
+    return out.reshape(bsz, q_len, num_qo_heads, head_dim).permute(0, 2, 1, 3).contiguous()
 
 def test_lossless_and_acceleration():
     # --- 1. Settings ---
@@ -90,15 +196,28 @@ def test_lossless_and_acceleration():
     # --- 5. Run PyTorch Baseline ---
     o_torch = torch_baseline_tree_attention(q, k, v, tree_mask, PREFIX_LEN)
 
-    # --- 6. Verification ---
-    max_diff = (o_triton - o_torch).abs().max().item()
-    print(f"Max Difference between PyTorch and Triton: {max_diff:.6f}")
-    if max_diff < 1e-3:
+    # --- 6. Run FlashAttention Baseline2 ---
+    o_flash = flashattention_baseline_tree_attention(q, k, v, tree_mask, PREFIX_LEN)
+
+    # --- 7. Verification ---
+    max_diff_torch = (o_triton - o_torch).abs().max().item()
+    max_diff_flash = (o_triton - o_flash).abs().max().item()
+    print(f"Max Difference between PyTorch and Triton: {max_diff_torch:.6f}")
+    print(f"Max Difference between FlashAttention and Triton: {max_diff_flash:.6f}")
+    if max_diff_torch < 1e-3 and max_diff_flash < 1e-3:
         print(" Triton Kernel is LOSSLESS.")
     else:
         print("Precision mismatch.")
 
-    # --- 7. Benchmarking ---
+    flashinfer_available = importlib.util.find_spec("flashinfer") is not None
+    o_flashinfer = None
+    if flashinfer_available:
+        o_flashinfer = flashinfer_baseline3_tree_attention(q, k, v, PREFIX_LEN, page_size=16)
+        max_diff_flashinfer = (o_triton - o_flashinfer).abs().max().item()
+        print(f"Max Difference between FlashInfer Baseline3 and Triton: {max_diff_flashinfer:.6f}")
+        print("[Note] FlashInfer Baseline3 is decode-style contiguous KV, so mismatch vs sparse tree mask is expected.")
+
+    # --- 8. Benchmarking ---
     print("\nRunning Benchmarks...")
     quantiles = [0.5, 0.2, 0.8]
     
@@ -116,10 +235,28 @@ def test_lossless_and_acceleration():
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=HEAD_DIM
         ), quantiles=quantiles
     )
+
+    ms_flash, min_flash, max_flash = triton.testing.do_bench(
+        lambda: flashattention_baseline_tree_attention(q, k, v, tree_mask, PREFIX_LEN), quantiles=quantiles
+    )
+
+    ms_flashinfer = None
+    if flashinfer_available:
+        ms_flashinfer, _, _ = triton.testing.do_bench(
+            lambda: flashinfer_baseline3_tree_attention(q, k, v, PREFIX_LEN, page_size=16), quantiles=quantiles
+        )
     
     print(f"PyTorch Dense+Mask Latency: {ms_torch:.3f} ms")
+    print(f"FlashAttention Baseline2 Latency: {ms_flash:.3f} ms")
+    if ms_flashinfer is not None:
+        print(f"FlashInfer Baseline3 Latency: {ms_flashinfer:.3f} ms")
     print(f"Triton Block-Sparse Latency: {ms_triton:.3f} ms")
     print(f"Speedup: {ms_torch / ms_triton:.2f}x")
+    print(f"Speedup vs FlashAttention Baseline2: {ms_flash / ms_triton:.2f}x")
+    if ms_flashinfer is not None:
+        print(f"Speedup vs FlashInfer Baseline3: {ms_flashinfer / ms_triton:.2f}x")
+    else:
+        print("FlashInfer Baseline3 skipped: flashinfer is not installed in this environment.")
 
 if __name__ == "__main__":
     test_lossless_and_acceleration()
